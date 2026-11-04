@@ -137,8 +137,8 @@
   .toast.err{background:var(--red);color:#fff}
   footer{margin-top:28px;font-size:12px;color:var(--text-muted);border-top:1px solid var(--border);padding-top:16px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 
-  @media(max-width:980px){.kpis{grid-template-columns:repeat(3,1fr)}.calc{grid-template-columns:repeat(2,1fr)}}
-  @media(max-width:760px){.kpis{grid-template-columns:repeat(2,1fr)}.reach-grid{grid-template-columns:repeat(2,1fr)}.fields{grid-template-columns:repeat(2,1fr)}.controls{align-items:flex-start}.controls-row{justify-content:flex-start}h1{font-size:26px}body{padding:28px 16px 130px}}
+  @media(max-width:980px){.kpis{grid-template-columns:repeat(3,1fr)}.kpi:last-child{grid-column:span 2}.calc{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:760px){.kpis{grid-template-columns:repeat(2,1fr)}.kpi:last-child{grid-column:1/-1}.reach-grid{grid-template-columns:repeat(2,1fr)}.fields{grid-template-columns:repeat(2,1fr)}.controls{align-items:flex-start}.controls-row{justify-content:flex-start}h1{font-size:26px}body{padding:28px 16px 130px}}
   @media(max-width:480px){.fields{grid-template-columns:1fr}.field .hint{min-height:0}}
   @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -197,7 +197,7 @@
     <div class="intro">
       <b>Como funciona:</b> escolha o mês, preencha os números e clique em <b>Salvar mês</b>.
       O dashboard atualiza na hora. Os campos de custo, CPL e ROAS são <b>calculados sozinhos</b> — você só digita o que vem do Meta Ads e das vendas.
-      Pode deixar em branco o que ainda não souber.
+      Pode deixar em branco o que ainda não souber. Na primeira vez que salvar, o site pede a <b>senha de lançamento</b>.
     </div>
 
     <div class="panel step">
@@ -249,7 +249,7 @@
 
     <div class="panel">
       <h3>Cópia de segurança</h3>
-      <p class="desc">Os dados ficam salvos neste navegador. Baixe uma cópia de vez em quando, principalmente antes de limpar o histórico do navegador ou trocar de computador.</p>
+      <p class="desc">Os dados ficam salvos online e aparecem em qualquer aparelho. Mesmo assim, baixe uma cópia de vez em quando, por segurança.</p>
       <div class="backup">
         <button class="btn" id="btnExport">Baixar cópia (.json)</button>
         <button class="btn" id="btnImport">Carregar cópia</button>
@@ -304,7 +304,9 @@ function seedData(){
       Set:{reach:R(245625,null,4420,1267,704,462),
            niteroi:U(2100.89,388,null,3,4000,0),
            barra:U(808.70,204,null,8,8500,0)},
-      Out:{reach:R(253197,null,4420,1489,842,537)}
+      Out:{reach:R(253197,null,4420,1489,842,537),
+           niteroi:U(1377.67,397,61,10,15200,null),
+           barra:U(1470.39,455,106,5,8000,null)}
     },
     updatedAt:null
   };
@@ -327,14 +329,44 @@ function loadState(){
   }catch(e){ storageOk = false; }
   return memoryFallback || seedData();
 }
-function persist(){
-  state.updatedAt = new Date().toISOString();
+let remoteMode = false;   // true quando o site está online com banco de dados
+let syncError = '';
+const API = '/api/dados';
+const PW_KEY = 'helen-funil-senha';
+
+function saveLocal(){
   memoryFallback = state;
+  try{ localStorage.setItem(STORE_KEY, JSON.stringify(state)); storageOk = true; }
+  catch(e){ storageOk = false; }
+}
+async function persist(){
+  state.updatedAt = new Date().toISOString();
+  saveLocal();
+  if(!remoteMode) return storageOk ? {ok:true, where:'local'} : {ok:false, reason:'navegador bloqueou'};
+  let senha = null;
+  try{ senha = localStorage.getItem(PW_KEY); }catch(e){}
+  if(!senha){
+    senha = prompt('Digite a senha de lançamento (a mesma configurada no Vercel):');
+    if(!senha) return {ok:false, reason:'sem-senha'};
+  }
   try{
-    localStorage.setItem(STORE_KEY, JSON.stringify(state));
-    storageOk = true;
-    return true;
-  }catch(e){ storageOk = false; return false; }
+    const r = await fetch(API, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({senha, data:state})});
+    if(r.status === 401){ try{ localStorage.removeItem(PW_KEY); }catch(e){} return {ok:false, reason:'senha'}; }
+    if(!r.ok){ const j = await r.json().catch(()=>({})); return {ok:false, reason:j.erro || ('erro '+r.status)}; }
+    try{ localStorage.setItem(PW_KEY, senha); }catch(e){}
+    return {ok:true, where:'online'};
+  }catch(e){ return {ok:false, reason:'sem conexão'}; }
+}
+async function fetchRemote(){
+  try{
+    const ctrl = new AbortController(); const t = setTimeout(()=>ctrl.abort(), 6000);
+    const r = await fetch(API+'?t='+Date.now(), {cache:'no-store', signal:ctrl.signal});
+    clearTimeout(t);
+    const j = await r.json().catch(()=>null);
+    if(r.ok && j && j.months) return {state:j};
+    if(r.status === 404 && j && j.vazio) return {empty:true};
+  }catch(e){}
+  return null;
 }
 let state = loadState();
 
@@ -629,7 +661,17 @@ function selectEditMonth(m){
   editMonth = m; buildChips(); fillForm();
 }
 
-function saveMonth(){
+const cap = t => t.charAt(0).toUpperCase() + t.slice(1);
+
+function reportSave(res, okMsg){
+  syncError = res.ok ? '' : (res.reason || 'erro');
+  renderStorageStatus();
+  if(res.ok) return toast(okMsg + (res.where==='online' ? ' online. Já aparece em todos os aparelhos.' : ' neste navegador.'));
+  const msgs = {senha:'Senha incorreta. Tente salvar de novo.', 'sem-senha':'Sem a senha, ficou salvo só neste aparelho.'};
+  toast(msgs[res.reason] || ('Não consegui salvar online ('+res.reason+'). Ficou só neste aparelho.'), true);
+}
+
+async function saveMonth(){
   const f = readForm();
   const cur = state.months[editMonth] || {};
   const next = {};
@@ -638,20 +680,21 @@ function saveMonth(){
   if(hasAny(f.barra)) next.barra = f.barra;
   if(cur.legacyTotal && !next.niteroi && !next.barra) next.legacyTotal = cur.legacyTotal;
   state.months[editMonth] = next;
-  const ok = persist();
+  const btn = document.getElementById('btnSave'); btn.disabled = true; btn.textContent = 'Salvando…';
+  const res = await persist();
+  btn.disabled = false; btn.textContent = 'Salvar mês';
   dirty = false;
   currentMonth = editMonth;
-  buildChips(); renderDashboard(); renderHistory(); updateSaveBar(); renderStorageStatus();
-  ok ? toast(`${MONTH_NAMES[editMonth][0].toUpperCase()+MONTH_NAMES[editMonth].slice(1)} salvo. Dashboard atualizado.`)
-     : toast('Não consegui gravar neste navegador. Baixe uma cópia para não perder.', true);
+  buildChips(); renderDashboard(); renderHistory(); updateSaveBar();
+  reportSave(res, cap(MONTH_NAMES[editMonth]) + ' salvo');
 }
 
-function clearMonth(){
+async function clearMonth(){
   if(!confirm(`Apagar todos os números de ${MONTH_NAMES[editMonth]}? Isso não pode ser desfeito.`)) return;
   delete state.months[editMonth];
-  persist();
-  buildChips(); fillForm(); renderDashboard(); renderHistory(); renderStorageStatus();
-  toast('Mês limpo.');
+  const res = await persist();
+  buildChips(); fillForm(); renderDashboard(); renderHistory();
+  reportSave(res, 'Mês limpo');
 }
 
 function renderHistory(){
@@ -675,11 +718,12 @@ function renderHistory(){
 
 function renderStorageStatus(){
   const el = document.getElementById('storageStatus');
-  if(!storageOk){ el.textContent = '⚠ Este navegador não permite salvar dados — baixe uma cópia ao terminar.'; el.style.color='var(--orange)'; return; }
-  el.style.color='';
+  el.style.color = '';
+  if(syncError){ el.textContent = '⚠ Não enviado ao servidor (' + syncError + '). Está salvo só neste aparelho.'; el.style.color = 'var(--orange)'; return; }
+  if(!remoteMode){ el.textContent = 'Modo local: os dados ficam só neste navegador.'; return; }
   el.textContent = state.updatedAt
-    ? '✓ Salvo neste navegador em ' + new Date(state.updatedAt).toLocaleString('pt-BR',{dateStyle:'short',timeStyle:'short'})
-    : 'Dados originais da planilha carregados';
+    ? '✓ Online · salvo em ' + new Date(state.updatedAt).toLocaleString('pt-BR',{dateStyle:'short',timeStyle:'short'})
+    : '✓ Online · ainda sem lançamentos salvos (mostrando os dados da planilha)';
 }
 
 /* Backup */
@@ -694,23 +738,25 @@ function exportBackup(){
 }
 function importBackup(file){
   const rd = new FileReader();
-  rd.onload = () => {
+  rd.onload = async () => {
     try{
-      const s = JSON.parse(rd.result);
-      if(!s || typeof s.months !== 'object') throw new Error('formato');
+      const x = JSON.parse(rd.result);
+      if(!x || typeof x.months !== 'object') throw new Error('formato');
       if(!confirm('Substituir todos os dados atuais pelos dados desta cópia?')) return;
-      state = s; persist();
+      state = x;
+      const res = await persist();
       currentMonth = pickInitialMonth(); editMonth = currentMonth;
-      refreshAll(); toast('Cópia carregada.');
+      refreshAll(); reportSave(res, 'Cópia carregada');
     }catch(e){ toast('Arquivo inválido. Use uma cópia baixada por este site.', true); }
   };
   rd.readAsText(file);
 }
-function resetToSeed(){
+async function resetToSeed(){
   if(!confirm('Voltar aos dados originais da planilha? Tudo o que você lançou depois será perdido.')) return;
-  state = seedData(); persist();
+  state = seedData();
+  const res = await persist();
   currentMonth = pickInitialMonth(); editMonth = currentMonth;
-  refreshAll(); toast('Dados originais restaurados.');
+  refreshAll(); reportSave(res, 'Dados originais restaurados');
 }
 
 /* ============================================================
@@ -789,10 +835,27 @@ document.getElementById('themeBtn').addEventListener('click', () => {
 buildFields('reachFields', REACH_FIELDS, 'reach');
 buildFields('fields-niteroi', UNIT_FIELDS, 'niteroi');
 buildFields('fields-barra', UNIT_FIELDS, 'barra');
-currentMonth = pickInitialMonth();
-editMonth = currentMonth;
-refreshAll();
-if(location.hash === '#lancar') showView('lancar');
+
+(async function init(){
+  document.body.style.opacity = '.45';
+  const rr = await fetchRemote();
+  if(rr){
+    remoteMode = true;
+    if(rr.state){ state = rr.state; saveLocal(); }
+  }
+  currentMonth = pickInitialMonth();
+  editMonth = currentMonth;
+  refreshAll();
+  if(location.hash === '#lancar') showView('lancar');
+  document.body.style.opacity = '';
+})();
+
+/* Ao voltar para a aba/aplicativo, busca os números mais recentes */
+document.addEventListener('visibilitychange', async () => {
+  if(document.visibilityState !== 'visible' || !remoteMode || dirty) return;
+  const rr = await fetchRemote();
+  if(rr && rr.state && !dirty){ state = rr.state; saveLocal(); refreshAll(); }
+});
 </script>
 </body>
 </html>
